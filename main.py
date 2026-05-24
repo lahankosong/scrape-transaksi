@@ -1,10 +1,13 @@
 """
 main.py — MyPertamina Scraper Service
-Deploy ke Render.com (Free Tier)
+Deploy ke Railway.com
 
 Dua mode trigger:
 1. Terjadwal  → dipanggil cPanel cron Rumahweb jam 00:05 WIB
 2. Manual     → dipanggil tombol scrape di Laravel
+
+v2: fetch transaksi & stok via browser (bukan aiohttp langsung)
+    agar tidak kena blokir IP datacenter Railway
 """
 
 import asyncio
@@ -13,7 +16,7 @@ import json
 import os
 import base64
 from datetime import datetime, timedelta
-from fastapi import FastAPI, Header, HTTPException, BackgroundTasks, Request
+from fastapi import FastAPI, Header, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 from typing import Optional
 
@@ -44,14 +47,14 @@ def log(msg: str):
     print(f"[{timestamp}] {msg}", flush=True)
 
 def default_dates():
-    """Default: hari ini"""
     today = datetime.now().strftime("%Y-%m-%d")
     return today, today
 
 
-# ── Core: Login ───────────────────────────────────────────────────────────────
+# ── Core: Login + Stok + Transaksi (semua via browser) ───────────────────────
 
-async def login_one(email: str, pin: str, label: str = "") -> dict:
+async def scrape_one(email: str, pin: str, label: str,
+                     start_date: str, end_date: str) -> dict:
     result = {
         "success":         False,
         "label":           label,
@@ -65,6 +68,8 @@ async def login_one(email: str, pin: str, label: str = "") -> dict:
         "stock_date":      None,
         "last_stock":      None,
         "last_stock_date": None,
+        "transactions":    [],
+        "summary":         None,
         "error":           None,
     }
 
@@ -84,7 +89,6 @@ async def login_one(email: str, pin: str, label: str = "") -> dict:
         )
 
         context = await browser.new_context(
-            # Pakai iPhone user-agent — terbukti work di localhost
             user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1",
             viewport={"width": 390, "height": 844},
             locale="id-ID",
@@ -114,6 +118,7 @@ async def login_one(email: str, pin: str, label: str = "") -> dict:
         page.on("request", handle_request)
 
         try:
+            # ── LOGIN ──────────────────────────────────────────────────────────
             log(f"  [{label}] Membuka halaman login...")
             await page.goto(
                 "https://subsiditepatlpg.mypertamina.id/merchant-login",
@@ -122,18 +127,15 @@ async def login_one(email: str, pin: str, label: str = "") -> dict:
             )
             await asyncio.sleep(2)
 
-            log(f"  [{label}] Input email...")
+            log(f"  [{label}] Input email & PIN...")
             await page.locator("input").nth(0).fill(email)
             await asyncio.sleep(0.3)
-
-            log(f"  [{label}] Input PIN...")
             await page.locator("input").nth(1).fill(pin)
             await asyncio.sleep(0.3)
 
             log(f"  [{label}] Klik login...")
             await page.locator("button").filter(has_text="MASUK").click()
 
-            # Tunggu token max 30 detik
             for _ in range(30):
                 if token_holder["token"]:
                     break
@@ -144,7 +146,7 @@ async def login_one(email: str, pin: str, label: str = "") -> dict:
                 log(f"  [{label}] ✗ {result['error']}")
                 return result
 
-            # Decode pangkalan_id dari JWT
+            # Decode pangkalan_id
             try:
                 parts   = token_holder["token"].split(".")
                 payload = json.loads(base64.b64decode(
@@ -155,8 +157,101 @@ async def login_one(email: str, pin: str, label: str = "") -> dict:
                 pass
 
             result["token"]   = token_holder["token"]
-            result["success"] = True
             log(f"  [{label}] ✓ Login berhasil")
+
+            # ── FETCH STOK via browser ─────────────────────────────────────────
+            log(f"  [{label}] Fetch stok via browser...")
+            try:
+                stok_data = await page.evaluate("""
+                    async (token) => {
+                        const res = await fetch(
+                            'https://api-map.my-pertamina.id/general/products/v1/products/user',
+                            {
+                                headers: {
+                                    'Authorization': 'Bearer ' + token,
+                                    'Accept': 'application/json',
+                                }
+                            }
+                        );
+                        return await res.json();
+                    }
+                """, token_holder["token"])
+
+                if stok_data.get("success") and stok_data.get("data"):
+                    d = stok_data["data"]
+                    result.update({
+                        "store_name":      d.get("storeName"),
+                        "stock_available": d.get("stockAvailable"),
+                        "stock_redeem":    d.get("stockRedeem"),
+                        "sold":            d.get("sold"),
+                        "stock_date":      d.get("stockDate"),
+                        "last_stock":      d.get("lastStock"),
+                        "last_stock_date": d.get("lastStockDate"),
+                    })
+                    if not result["label"]:
+                        result["label"] = d.get("storeName", email)
+                    log(f"  [{label}] ✓ Stok: available={d.get('stockAvailable')} redeem={d.get('stockRedeem')} sold={d.get('sold')}")
+                else:
+                    log(f"  [{label}] ⚠ Stok response: {stok_data}")
+            except Exception as e:
+                log(f"  [{label}] ⚠ Stok gagal: {str(e)[:80]}")
+
+            # ── FETCH TRANSAKSI via browser (per batch 7 hari) ─────────────────
+            log(f"  [{label}] Fetch transaksi {start_date} s/d {end_date} via browser...")
+            all_customers = []
+            summary       = None
+
+            start   = datetime.strptime(start_date, "%Y-%m-%d")
+            end     = datetime.strptime(end_date,   "%Y-%m-%d")
+            current = start
+
+            while current <= end:
+                batch_end = min(current + timedelta(days=6), end)
+                s = current.strftime("%Y-%m-%d")
+                e = batch_end.strftime("%Y-%m-%d")
+
+                try:
+                    tx_data = await page.evaluate("""
+                        async ([token, startDate, endDate]) => {
+                            const params = new URLSearchParams({
+                                search: '',
+                                sort: 'latest',
+                                startDate: startDate,
+                                endDate: endDate,
+                            });
+                            const res = await fetch(
+                                'https://api-map.my-pertamina.id/general/v3/transactions/report?' + params,
+                                {
+                                    headers: {
+                                        'Authorization': 'Bearer ' + token,
+                                        'Accept': 'application/json',
+                                    }
+                                }
+                            );
+                            return await res.json();
+                        }
+                    """, [token_holder["token"], s, e])
+
+                    if tx_data.get("success"):
+                        customers = tx_data["data"].get("customersReport", [])
+                        all_customers.extend(customers)
+                        if tx_data["data"].get("summaryReport"):
+                            summary = tx_data["data"]["summaryReport"]
+                            summary["date"] = e
+                        log(f"  [{label}] Batch {s}~{e}: {len(customers)} transaksi")
+                    else:
+                        log(f"  [{label}] Batch {s}~{e} gagal: {tx_data}")
+
+                except Exception as e_err:
+                    log(f"  [{label}] Batch {s}~{e} error: {str(e_err)[:80]}")
+
+                await asyncio.sleep(1)
+                current = batch_end + timedelta(days=1)
+
+            result["transactions"] = all_customers
+            result["summary"]      = summary
+            result["success"]      = True
+            log(f"  [{label}] ✓ Total transaksi: {len(all_customers)}")
 
         except Exception as e:
             result["error"] = f"Browser error: {str(e)}"
@@ -164,104 +259,13 @@ async def login_one(email: str, pin: str, label: str = "") -> dict:
         finally:
             await browser.close()
 
-    # Ambil info stok
-    if result["token"]:
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    "https://api-map.my-pertamina.id/general/products/v1/products/user",
-                    headers={
-                        "Authorization": f"Bearer {result['token']}",
-                        "Accept":        "application/json",
-                        "User-Agent":    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X)",
-                        "Origin":        "https://subsiditepatlpg.mypertamina.id",
-                        "Referer":       "https://subsiditepatlpg.mypertamina.id/",
-                    },
-                    timeout=aiohttp.ClientTimeout(total=15)
-                ) as res:
-                    if res.status == 200:
-                        data = await res.json()
-                        if data.get("success") and data.get("data"):
-                            d = data["data"]
-                            result.update({
-                                "store_name":      d.get("storeName"),
-                                "stock_available": d.get("stockAvailable"),
-                                "stock_redeem":    d.get("stockRedeem"),
-                                "sold":            d.get("sold"),
-                                "stock_date":      d.get("stockDate"),
-                                "last_stock":      d.get("lastStock"),
-                                "last_stock_date": d.get("lastStockDate"),
-                            })
-                            if not result["label"]:
-                                result["label"] = d.get("storeName", email)
-                            log(f"  [{label}] ✓ Stok: available={d.get('stockAvailable')} redeem={d.get('stockRedeem')} sold={d.get('sold')}")
-        except Exception as e:
-            log(f"  [{label}] ⚠ Stok gagal: {str(e)}")
-
     return result
-
-
-# ── Core: Fetch Transaksi ─────────────────────────────────────────────────────
-
-async def fetch_transactions(token: str, start_date: str, end_date: str, label: str = "") -> dict:
-    all_customers = []
-    summary       = None
-
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept":        "application/json",
-        "User-Agent":    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X)",
-        "Origin":        "https://subsiditepatlpg.mypertamina.id",
-        "Referer":       "https://subsiditepatlpg.mypertamina.id/",
-    }
-
-    start   = datetime.strptime(start_date, "%Y-%m-%d")
-    end     = datetime.strptime(end_date,   "%Y-%m-%d")
-    current = start
-
-    async with aiohttp.ClientSession() as session:
-        while current <= end:
-            batch_end = min(current + timedelta(days=6), end)
-
-            for attempt in range(3):
-                try:
-                    async with session.get(
-                        "https://api-map.my-pertamina.id/general/v3/transactions/report",
-                        headers=headers,
-                        params={
-                            "search":    "",
-                            "sort":      "latest",
-                            "startDate": current.strftime("%Y-%m-%d"),
-                            "endDate":   batch_end.strftime("%Y-%m-%d"),
-                        },
-                        timeout=aiohttp.ClientTimeout(total=30)
-                    ) as res:
-                        if res.status == 200:
-                            body = await res.json()
-                            if body.get("success"):
-                                customers = body["data"].get("customersReport", [])
-                                all_customers.extend(customers)
-                                if body["data"].get("summaryReport"):
-                                    summary = body["data"]["summaryReport"]
-                                    summary["date"] = batch_end.strftime("%Y-%m-%d")
-                                break
-                        else:
-                            log(f"  [{label}] Transaksi HTTP {res.status}, attempt {attempt+1}")
-                except Exception as e:
-                    log(f"  [{label}] Transaksi error: {str(e)[:60]}, attempt {attempt+1}")
-                    if attempt < 2:
-                        await asyncio.sleep(2)
-
-            await asyncio.sleep(1)
-            current = batch_end + timedelta(days=1)
-
-    log(f"  [{label}] ✓ {len(all_customers)} transaksi ditemukan")
-    return {"success": True, "customers": all_customers, "summary": summary}
 
 
 # ── Core: Kirim ke Laravel ────────────────────────────────────────────────────
 
-async def send_to_laravel(tokens: list, api_url: str, api_key: str, date_from: str, date_to: str) -> bool:
+async def send_to_laravel(tokens: list, api_url: str, api_key: str,
+                          date_from: str, date_to: str) -> bool:
     log(f"Mengirim {len(tokens)} hasil ke Laravel...")
 
     async with aiohttp.ClientSession() as session:
@@ -358,42 +362,33 @@ async def run_scrape(date_from: str = "", date_to: str = ""):
             failed.append({"email": email, "error": "Kredensial kosong"})
             continue
 
-        # Login + ambil stok
-        login_result = await login_one(email, pin, label)
+        # Scrape: login + stok + transaksi semuanya via browser
+        res = await scrape_one(email, pin, label, date_from, date_to)
 
-        if not login_result["success"]:
-            failed.append({"email": email, "error": login_result.get("error")})
-            log(f"  ✗ Gagal: {login_result.get('error','')[:80]}")
-            if i < len(accounts):
-                await asyncio.sleep(3)
-            continue
-
-        # Fetch transaksi
-        tx_result = await fetch_transactions(
-            login_result["token"], date_from, date_to, label
-        )
-
-        successful.append({
-            "email":           email,
-            "token":           login_result["token"],
-            "pangkalan_id":    login_result["pangkalan_id"],
-            "store_name":      login_result["store_name"],
-            "stock_available": login_result["stock_available"],
-            "stock_redeem":    login_result["stock_redeem"],
-            "sold":            login_result["sold"],
-            "stock_date":      login_result.get("stock_date"),
-            "last_stock":      login_result.get("last_stock"),
-            "last_stock_date": login_result.get("last_stock_date"),
-            "stock_data": {
-                "stockAvailable": login_result["stock_available"],
-                "stockRedeem":    login_result["stock_redeem"],
-                "sold":           login_result["sold"],
-            },
-            "transactions": tx_result.get("customers", []),
-            "summary":      tx_result.get("summary"),
-        })
-
-        log(f"  ✓ {label} selesai ({len(tx_result.get('customers',[]))} transaksi)")
+        if not res["success"]:
+            failed.append({"email": email, "error": res.get("error")})
+            log(f"  ✗ Gagal: {res.get('error','')[:80]}")
+        else:
+            successful.append({
+                "email":           email,
+                "token":           res["token"],
+                "pangkalan_id":    res["pangkalan_id"],
+                "store_name":      res["store_name"],
+                "stock_available": res["stock_available"],
+                "stock_redeem":    res["stock_redeem"],
+                "sold":            res["sold"],
+                "stock_date":      res.get("stock_date"),
+                "last_stock":      res.get("last_stock"),
+                "last_stock_date": res.get("last_stock_date"),
+                "stock_data": {
+                    "stockAvailable": res["stock_available"],
+                    "stockRedeem":    res["stock_redeem"],
+                    "sold":           res["sold"],
+                },
+                "transactions": res["transactions"],
+                "summary":      res["summary"],
+            })
+            log(f"  ✓ {label} selesai ({len(res['transactions'])} transaksi)")
 
         if i < len(accounts):
             await asyncio.sleep(3)
@@ -401,7 +396,6 @@ async def run_scrape(date_from: str = "", date_to: str = ""):
     log("-" * 55)
     log(f"Selesai: {len(successful)} berhasil, {len(failed)} gagal")
 
-    # Kirim ke Laravel
     ok = False
     if successful:
         ok = await send_to_laravel(successful, api_url, api_key, date_from, date_to)
@@ -427,16 +421,14 @@ async def run_scrape(date_from: str = "", date_to: str = ""):
 
 @app.get("/")
 def root():
-    """Info service + status"""
     return {
-        "service":  "MyPertamina Scraper",
+        "service":  "MyPertamina Scraper v2",
         "status":   "running" if ScrapeStatus.running else "idle",
         "last_run": ScrapeStatus.last_run,
     }
 
 @app.get("/health")
 def health():
-    """Health check — dipanggil cPanel cron untuk wake up service"""
     return {"status": "ok", "time": datetime.now().isoformat()}
 
 @app.post("/scrape")
@@ -445,11 +437,6 @@ async def scrape(
     background_tasks: BackgroundTasks,
     x_api_key:        str = Header(default=""),
 ):
-    """
-    Trigger scrape — dipanggil dari:
-    1. Tombol manual di Laravel
-    2. cPanel cron Rumahweb jam 00:05 WIB
-    """
     if not API_KEY or x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API Key")
 
@@ -475,7 +462,6 @@ async def scrape(
 
 @app.get("/status")
 def status(x_api_key: str = Header(default="")):
-    """Cek status dan hasil scrape terakhir"""
     if not API_KEY or x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API Key")
 
