@@ -20,7 +20,7 @@
 
 // ── Konfigurasi ───────────────────────────────────────────────────────────────
 
-define('RENDER_SCRAPER_URL', 'https://mypertamina-scraper.onrender.com'); // ganti dengan URL Render kamu
+define('RENDER_SCRAPER_URL', 'https://scrape-transaksi-production.up.railway.app'); // ganti dengan URL Render kamu
 define('API_KEY',            'isi_dengan_LARAVEL_API_KEY_kamu');
 define('LOG_FILE',           __DIR__ . '/cron.log');
 
