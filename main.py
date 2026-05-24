@@ -2,12 +2,8 @@
 main.py — MyPertamina Scraper Service
 Deploy ke Railway.com
 
-Dua mode trigger:
-1. Terjadwal  → dipanggil cPanel cron Rumahweb jam 00:05 WIB
-2. Manual     → dipanggil tombol scrape di Laravel
-
-v2: fetch transaksi & stok via browser (bukan aiohttp langsung)
-    agar tidak kena blokir IP datacenter Railway
+v3: tunggu navigasi selesai setelah login,
+    fetch API via page.evaluate setelah halaman dashboard load
 """
 
 import asyncio
@@ -25,7 +21,7 @@ app = FastAPI(title="MyPertamina Scraper Service")
 API_KEY = os.environ.get("LARAVEL_API_KEY", "")
 
 
-# ── Status tracker in-memory ──────────────────────────────────────────────────
+# ── Status tracker ────────────────────────────────────────────────────────────
 
 class ScrapeStatus:
     running     = False
@@ -51,7 +47,7 @@ def default_dates():
     return today, today
 
 
-# ── Core: Login + Stok + Transaksi (semua via browser) ───────────────────────
+# ── Core: Scrape satu akun ────────────────────────────────────────────────────
 
 async def scrape_one(email: str, pin: str, label: str,
                      start_date: str, end_date: str) -> dict:
@@ -136,6 +132,7 @@ async def scrape_one(email: str, pin: str, label: str,
             log(f"  [{label}] Klik login...")
             await page.locator("button").filter(has_text="MASUK").click()
 
+            # Tunggu token + navigasi ke dashboard selesai
             for _ in range(30):
                 if token_holder["token"]:
                     break
@@ -145,6 +142,13 @@ async def scrape_one(email: str, pin: str, label: str,
                 result["error"] = "Token tidak tertangkap — cek kredensial"
                 log(f"  [{label}] ✗ {result['error']}")
                 return result
+
+            # Tunggu halaman dashboard benar-benar selesai load
+            log(f"  [{label}] Menunggu dashboard load...")
+            await page.wait_for_load_state("networkidle", timeout=30000)
+            await asyncio.sleep(2)
+
+            log(f"  [{label}] URL sekarang: {page.url}")
 
             # Decode pangkalan_id
             try:
@@ -156,48 +160,56 @@ async def scrape_one(email: str, pin: str, label: str,
             except Exception:
                 pass
 
-            result["token"]   = token_holder["token"]
-            log(f"  [{label}] ✓ Login berhasil")
+            result["token"] = token_holder["token"]
+            log(f"  [{label}] ✓ Login berhasil, pangkalan_id={result['pangkalan_id']}")
 
-            # ── FETCH STOK via browser ─────────────────────────────────────────
-            log(f"  [{label}] Fetch stok via browser...")
+            # ── FETCH STOK via aiohttp dengan cookie dari browser ──────────────
+            # Ambil cookies dari browser untuk dipakai di aiohttp
+            log(f"  [{label}] Fetch stok...")
             try:
-                stok_data = await page.evaluate("""
-                    async (token) => {
-                        const res = await fetch(
-                            'https://api-map.my-pertamina.id/general/products/v1/products/user',
-                            {
-                                headers: {
-                                    'Authorization': 'Bearer ' + token,
-                                    'Accept': 'application/json',
-                                }
-                            }
-                        );
-                        return await res.json();
-                    }
-                """, token_holder["token"])
+                cookies = await context.cookies()
+                cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
 
-                if stok_data.get("success") and stok_data.get("data"):
-                    d = stok_data["data"]
-                    result.update({
-                        "store_name":      d.get("storeName"),
-                        "stock_available": d.get("stockAvailable"),
-                        "stock_redeem":    d.get("stockRedeem"),
-                        "sold":            d.get("sold"),
-                        "stock_date":      d.get("stockDate"),
-                        "last_stock":      d.get("lastStock"),
-                        "last_stock_date": d.get("lastStockDate"),
-                    })
-                    if not result["label"]:
-                        result["label"] = d.get("storeName", email)
-                    log(f"  [{label}] ✓ Stok: available={d.get('stockAvailable')} redeem={d.get('stockRedeem')} sold={d.get('sold')}")
-                else:
-                    log(f"  [{label}] ⚠ Stok response: {stok_data}")
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        "https://api-map.my-pertamina.id/general/products/v1/products/user",
+                        headers={
+                            "Authorization": f"Bearer {token_holder['token']}",
+                            "Accept":        "application/json",
+                            "User-Agent":    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15",
+                            "Origin":        "https://subsiditepatlpg.mypertamina.id",
+                            "Referer":       "https://subsiditepatlpg.mypertamina.id/",
+                            "Cookie":        cookie_str,
+                        },
+                        timeout=aiohttp.ClientTimeout(total=15)
+                    ) as res:
+                        log(f"  [{label}] Stok HTTP status: {res.status}")
+                        if res.status == 200:
+                            data = await res.json()
+                            if data.get("success") and data.get("data"):
+                                d = data["data"]
+                                result.update({
+                                    "store_name":      d.get("storeName"),
+                                    "stock_available": d.get("stockAvailable"),
+                                    "stock_redeem":    d.get("stockRedeem"),
+                                    "sold":            d.get("sold"),
+                                    "stock_date":      d.get("stockDate"),
+                                    "last_stock":      d.get("lastStock"),
+                                    "last_stock_date": d.get("lastStockDate"),
+                                })
+                                if not result["label"]:
+                                    result["label"] = d.get("storeName", email)
+                                log(f"  [{label}] ✓ Stok: available={d.get('stockAvailable')} sold={d.get('sold')}")
+                            else:
+                                log(f"  [{label}] ⚠ Stok response: {data}")
+                        else:
+                            body = await res.text()
+                            log(f"  [{label}] ⚠ Stok gagal {res.status}: {body[:100]}")
             except Exception as e:
-                log(f"  [{label}] ⚠ Stok gagal: {str(e)[:80]}")
+                log(f"  [{label}] ⚠ Stok error: {str(e)[:100]}")
 
-            # ── FETCH TRANSAKSI via browser (per batch 7 hari) ─────────────────
-            log(f"  [{label}] Fetch transaksi {start_date} s/d {end_date} via browser...")
+            # ── FETCH TRANSAKSI via aiohttp dengan cookie dari browser ─────────
+            log(f"  [{label}] Fetch transaksi {start_date} s/d {end_date}...")
             all_customers = []
             summary       = None
 
@@ -205,48 +217,60 @@ async def scrape_one(email: str, pin: str, label: str,
             end     = datetime.strptime(end_date,   "%Y-%m-%d")
             current = start
 
-            while current <= end:
-                batch_end = min(current + timedelta(days=6), end)
-                s = current.strftime("%Y-%m-%d")
-                e = batch_end.strftime("%Y-%m-%d")
+            async with aiohttp.ClientSession() as session:
+                headers = {
+                    "Authorization": f"Bearer {token_holder['token']}",
+                    "Accept":        "application/json",
+                    "User-Agent":    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15",
+                    "Origin":        "https://subsiditepatlpg.mypertamina.id",
+                    "Referer":       "https://subsiditepatlpg.mypertamina.id/",
+                    "Cookie":        cookie_str,
+                }
 
-                try:
-                    tx_data = await page.evaluate("""
-                        async ([token, startDate, endDate]) => {
-                            const params = new URLSearchParams({
-                                search: '',
-                                sort: 'latest',
-                                startDate: startDate,
-                                endDate: endDate,
-                            });
-                            const res = await fetch(
-                                'https://api-map.my-pertamina.id/general/v3/transactions/report?' + params,
-                                {
-                                    headers: {
-                                        'Authorization': 'Bearer ' + token,
-                                        'Accept': 'application/json',
-                                    }
-                                }
-                            );
-                            return await res.json();
-                        }
-                    """, [token_holder["token"], s, e])
+                while current <= end:
+                    batch_end = min(current + timedelta(days=6), end)
+                    s = current.strftime("%Y-%m-%d")
+                    e = batch_end.strftime("%Y-%m-%d")
 
-                    if tx_data.get("success"):
-                        customers = tx_data["data"].get("customersReport", [])
-                        all_customers.extend(customers)
-                        if tx_data["data"].get("summaryReport"):
-                            summary = tx_data["data"]["summaryReport"]
-                            summary["date"] = e
-                        log(f"  [{label}] Batch {s}~{e}: {len(customers)} transaksi")
-                    else:
-                        log(f"  [{label}] Batch {s}~{e} gagal: {tx_data}")
+                    for attempt in range(3):
+                        try:
+                            async with session.get(
+                                "https://api-map.my-pertamina.id/general/v3/transactions/report",
+                                headers=headers,
+                                params={
+                                    "search":    "",
+                                    "sort":      "latest",
+                                    "startDate": s,
+                                    "endDate":   e,
+                                },
+                                timeout=aiohttp.ClientTimeout(total=30)
+                            ) as res:
+                                log(f"  [{label}] Batch {s}~{e} HTTP: {res.status}")
+                                if res.status == 200:
+                                    body = await res.json()
+                                    if body.get("success"):
+                                        customers = body["data"].get("customersReport", [])
+                                        all_customers.extend(customers)
+                                        if body["data"].get("summaryReport"):
+                                            summary = body["data"]["summaryReport"]
+                                            summary["date"] = e
+                                        log(f"  [{label}] Batch {s}~{e}: {len(customers)} transaksi")
+                                        break
+                                    else:
+                                        log(f"  [{label}] Batch {s}~{e} gagal: {body}")
+                                        break
+                                else:
+                                    body = await res.text()
+                                    log(f"  [{label}] Batch {s}~{e} error {res.status}: {body[:80]}")
+                                    if attempt < 2:
+                                        await asyncio.sleep(3)
+                        except Exception as e_err:
+                            log(f"  [{label}] Batch {s}~{e} exception: {str(e_err)[:80]}")
+                            if attempt < 2:
+                                await asyncio.sleep(3)
 
-                except Exception as e_err:
-                    log(f"  [{label}] Batch {s}~{e} error: {str(e_err)[:80]}")
-
-                await asyncio.sleep(1)
-                current = batch_end + timedelta(days=1)
+                    await asyncio.sleep(1)
+                    current = batch_end + timedelta(days=1)
 
             result["transactions"] = all_customers
             result["summary"]      = summary
@@ -320,7 +344,6 @@ async def run_scrape(date_from: str = "", date_to: str = ""):
     log(f"Scrape dimulai | {date_from} s/d {date_to}")
     log("=" * 55)
 
-    # Fetch akun dari Laravel
     accounts = []
     try:
         import urllib.request
@@ -362,7 +385,6 @@ async def run_scrape(date_from: str = "", date_to: str = ""):
             failed.append({"email": email, "error": "Kredensial kosong"})
             continue
 
-        # Scrape: login + stok + transaksi semuanya via browser
         res = await scrape_one(email, pin, label, date_from, date_to)
 
         if not res["success"]:
@@ -422,7 +444,7 @@ async def run_scrape(date_from: str = "", date_to: str = ""):
 @app.get("/")
 def root():
     return {
-        "service":  "MyPertamina Scraper v2",
+        "service":  "MyPertamina Scraper v3",
         "status":   "running" if ScrapeStatus.running else "idle",
         "last_run": ScrapeStatus.last_run,
     }
